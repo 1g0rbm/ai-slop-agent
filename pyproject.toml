@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-lvl"
+version = "0.1.0"
+description = "Минимальный интерактивный AI-агент с переключаемыми провайдерами"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.28.1",
+  "openai>=1.66.0",
+  "python-dotenv>=1.0.1",
+  "typer>=0.15.1",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.9.10",
+]
+
+[project.scripts]
+agent-lvl = "agent_lvl.cli:main"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
