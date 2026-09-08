@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up tools
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Test
+        run: mise run test

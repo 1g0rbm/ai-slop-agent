@@ -1,5 +1,9 @@
 # agent-lvl
 
+[![CI](https://github.com/1g0rbm/ai-slop-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/1g0rbm/ai-slop-agent/actions/workflows/ci.yml)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
+[![Ruff](https://img.shields.io/badge/Ruff-checked-blue.svg)](https://docs.astral.sh/ruff/)
+
 Минимальный интерактивный AI-агент на Python с поддержкой DeepSeek, Qwen Cloud и локального API в формате Ollama.
 
 ## Требования
