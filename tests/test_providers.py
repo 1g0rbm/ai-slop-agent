@@ -7,8 +7,10 @@ import pytest
 from agent_lvl.providers import (
     LOCAL_API_URL,
     LOCAL_MODEL,
+    ChatResult,
     LocalProvider,
     OpenAICompatibleProvider,
+    TokenUsage,
     create_provider,
 )
 
@@ -20,7 +22,12 @@ class FakeCompletions:
     def create(self, **kwargs: object) -> SimpleNamespace:
         self.calls.append(kwargs)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Ответ модели"))]
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Ответ модели"))],
+            usage=SimpleNamespace(
+                prompt_tokens=42,
+                completion_tokens=8,
+                total_tokens=50,
+            ),
         )
 
 
@@ -58,12 +65,21 @@ def test_openai_compatible_provider_uses_model_and_history() -> None:
     messages = [{"role": "user", "content": "Привет"}]
 
     assert provider.model == "test-model"
-    assert provider.respond(messages) == "Ответ модели"
+    assert provider.respond(messages) == ChatResult(
+        content="Ответ модели",
+        usage=TokenUsage(input_tokens=42, output_tokens=8, total_tokens=50),
+    )
     assert completions.calls == [{"model": "test-model", "messages": messages}]
 
 
 def test_local_provider_sends_configured_payload_and_authentication() -> None:
-    response = FakeResponse({"message": {"content": "Локальный ответ"}})
+    response = FakeResponse(
+        {
+            "message": {"content": "Локальный ответ"},
+            "prompt_eval_count": 37,
+            "eval_count": 5,
+        }
+    )
     client = FakeHttpClient(response)
     provider = LocalProvider(
         url="http://localhost:11434/api/chat",
@@ -79,7 +95,10 @@ def test_local_provider_sends_configured_payload_and_authentication() -> None:
     messages = [{"role": "user", "content": "Привет"}]
 
     assert provider.model == "custom-model"
-    assert provider.respond(messages) == "Локальный ответ"
+    assert provider.respond(messages) == ChatResult(
+        content="Локальный ответ",
+        usage=TokenUsage(input_tokens=37, output_tokens=5, total_tokens=42),
+    )
     assert response.status_checked
     assert client.calls == [
         {
@@ -108,6 +127,13 @@ def test_factory_creates_local_provider_with_defaults() -> None:
     assert provider._model == LOCAL_MODEL
 
 
+def test_factory_configures_local_context_window() -> None:
+    provider = create_provider({"AI_PROVIDER": "local", "LOCAL_NUM_CTX": "512"})
+
+    assert isinstance(provider, LocalProvider)
+    assert provider._context_window == 512
+
+
 def test_factory_creates_qwen_provider() -> None:
     provider = create_provider(
         {
@@ -132,6 +158,7 @@ def test_factory_creates_qwen_provider() -> None:
         ),
         ({"AI_PROVIDER": "local", "LOCAL_THINK": "maybe"}, "true или false"),
         ({"AI_PROVIDER": "local", "LOCAL_MAX_TOKENS": "0"}, "больше нуля"),
+        ({"AI_PROVIDER": "local", "LOCAL_NUM_CTX": "0"}, "больше нуля"),
     ],
 )
 def test_factory_rejects_invalid_configuration(

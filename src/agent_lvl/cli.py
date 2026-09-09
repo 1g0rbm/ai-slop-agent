@@ -5,7 +5,7 @@ import os
 import typer
 from dotenv import load_dotenv
 
-from .agent import Agent
+from .agent import Agent, AgentResponse
 from .history import HISTORY_DB_NAME, SQLiteHistory, history_limit
 from .providers import create_provider
 
@@ -62,9 +62,32 @@ def chat() -> None:
             continue
 
         try:
-            typer.echo(f"Агент: {agent.respond(message)}")
+            result = agent.respond_with_usage(message)
+            typer.echo(f"Агент: {result.content}")
+            _display_token_usage(result)
         except Exception as error:
             typer.echo(f"Ошибка запроса ({provider_name}): {error}", err=True)
+
+
+def _display_token_usage(result: AgentResponse) -> None:
+    if result.usage is None:
+        typer.echo("Токены текущего запроса и ответа: недоступны.")
+    else:
+        typer.echo(
+            "Токены: "
+            f"текущий запрос — {_format_tokens(result.usage.input_tokens)}, "
+            f"ответ модели — {_format_tokens(result.usage.output_tokens)}."
+        )
+
+    totals = result.conversation_totals
+    suffix = ""
+    if not totals.complete:
+        suffix = f" (без данных для {totals.untracked_exchanges} пар)"
+    typer.echo(f"Токены всего диалога — {_format_tokens(totals.total_tokens)}{suffix}.")
+
+
+def _format_tokens(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
 
 
 def main() -> None:

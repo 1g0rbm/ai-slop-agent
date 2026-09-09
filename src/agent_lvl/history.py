@@ -20,6 +20,24 @@ class Exchange:
     user_created_at: datetime
     assistant_created_at: datetime
     model: str
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class TokenTotals:
+    """Накопленная статистика токенов сохранённого диалога."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    untracked_exchanges: int
+
+    @property
+    def complete(self) -> bool:
+        """Вернуть True, если статистика есть для каждой пары."""
+        return self.untracked_exchanges == 0
 
 
 class SQLiteHistory:
@@ -44,10 +62,12 @@ class SQLiteHistory:
 
         query = """
             SELECT user_content, assistant_content,
-                   user_created_at, assistant_created_at, model
+                   user_created_at, assistant_created_at, model,
+                   input_tokens, output_tokens, total_tokens
             FROM (
                 SELECT id, user_content, assistant_content,
-                       user_created_at, assistant_created_at, model
+                       user_created_at, assistant_created_at, model,
+                       input_tokens, output_tokens, total_tokens
                 FROM exchanges
                 ORDER BY id DESC
                 LIMIT ?
@@ -63,9 +83,10 @@ class SQLiteHistory:
                 """
                 INSERT INTO exchanges (
                     user_content, assistant_content,
-                    user_created_at, assistant_created_at, model
+                    user_created_at, assistant_created_at, model,
+                    input_tokens, output_tokens, total_tokens
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     exchange.user_content,
@@ -73,6 +94,9 @@ class SQLiteHistory:
                     exchange.user_created_at.isoformat(),
                     exchange.assistant_created_at.isoformat(),
                     exchange.model,
+                    exchange.input_tokens,
+                    exchange.output_tokens,
+                    exchange.total_tokens,
                 ),
             )
 
@@ -87,6 +111,27 @@ class SQLiteHistory:
         with self._connect() as connection:
             connection.execute("DELETE FROM exchanges")
 
+    def token_totals(self) -> TokenTotals:
+        """Вернуть сумму известных токенов всех завершённых запросов."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(SUM(input_tokens), 0),
+                       COALESCE(SUM(output_tokens), 0),
+                       COALESCE(SUM(total_tokens), 0),
+                       COALESCE(SUM(
+                           CASE WHEN total_tokens IS NULL THEN 1 ELSE 0 END
+                       ), 0)
+                FROM exchanges
+                """
+            ).fetchone()
+        return TokenTotals(
+            input_tokens=int(row[0]),
+            output_tokens=int(row[1]),
+            total_tokens=int(row[2]),
+            untracked_exchanges=int(row[3]),
+        )
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -97,16 +142,29 @@ class SQLiteHistory:
                     assistant_content TEXT NOT NULL,
                     user_created_at TEXT NOT NULL,
                     assistant_created_at TEXT NOT NULL,
-                    model TEXT NOT NULL
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    total_tokens INTEGER
                 )
                 """
             )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(exchanges)").fetchall()
+            }
+            for column in ("input_tokens", "output_tokens", "total_tokens"):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE exchanges ADD COLUMN {column} INTEGER"
+                    )
 
     def _select(
         self,
         query: str = """
             SELECT user_content, assistant_content,
-                   user_created_at, assistant_created_at, model
+                   user_created_at, assistant_created_at, model,
+                   input_tokens, output_tokens, total_tokens
             FROM exchanges
             ORDER BY id
         """,
@@ -121,6 +179,9 @@ class SQLiteHistory:
                 user_created_at=datetime.fromisoformat(row[2]),
                 assistant_created_at=datetime.fromisoformat(row[3]),
                 model=row[4],
+                input_tokens=row[5],
+                output_tokens=row[6],
+                total_tokens=row[7],
             )
             for row in rows
         ]

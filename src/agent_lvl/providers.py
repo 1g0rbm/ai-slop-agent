@@ -3,6 +3,7 @@
 import math
 import os
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 import httpx
@@ -10,6 +11,24 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
 Message = dict[str, str]
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """Число токенов, фактически учтённых провайдером."""
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    """Ответ модели вместе с доступной статистикой токенов."""
+
+    content: str
+    usage: TokenUsage | None = None
+
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
@@ -25,8 +44,8 @@ class ChatProvider(Protocol):
         """Вернуть название используемой модели."""
         ...
 
-    def respond(self, messages: list[Message]) -> str:
-        """Вернуть ответ модели на переданную историю."""
+    def respond(self, messages: list[Message]) -> ChatResult:
+        """Вернуть ответ модели и доступную статистику токенов."""
         ...
 
 
@@ -44,7 +63,7 @@ class OpenAICompatibleProvider:
         """Вернуть название используемой модели."""
         return self._model
 
-    def respond(self, messages: list[Message]) -> str:
+    def respond(self, messages: list[Message]) -> ChatResult:
         """Отправить историю через OpenAI-совместимый API."""
         completion = self._client.chat.completions.create(
             model=self._model,
@@ -53,7 +72,16 @@ class OpenAICompatibleProvider:
         content = completion.choices[0].message.content
         if not content:
             raise RuntimeError("модель вернула пустой ответ")
-        return content
+
+        usage = completion.usage
+        token_usage = None
+        if usage is not None:
+            token_usage = TokenUsage(
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+            )
+        return ChatResult(content=content, usage=token_usage)
 
 
 class LocalProvider:
@@ -69,6 +97,7 @@ class LocalProvider:
         think: bool,
         timeout_seconds: float,
         api_key: str | None = None,
+        context_window: int | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self._url = url
@@ -78,6 +107,7 @@ class LocalProvider:
         self._num_predict = num_predict
         self._think = think
         self._api_key = api_key
+        self._context_window = context_window
         self._client = client or httpx.Client(
             timeout=timeout_seconds,
             follow_redirects=True,
@@ -88,11 +118,18 @@ class LocalProvider:
         """Вернуть название используемой модели."""
         return self._model
 
-    def respond(self, messages: list[Message]) -> str:
+    def respond(self, messages: list[Message]) -> ChatResult:
         """Отправить историю в локальный API и вернуть ответ."""
         headers = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
+
+        options = {
+            "temperature": self._temperature,
+            "num_predict": self._num_predict,
+        }
+        if self._context_window is not None:
+            options["num_ctx"] = self._context_window
 
         response = self._client.post(
             self._url,
@@ -103,10 +140,7 @@ class LocalProvider:
                 "stream": False,
                 "think": self._think,
                 "max_tokens": self._max_tokens,
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._num_predict,
-                },
+                "options": options,
             },
         )
         response.raise_for_status()
@@ -119,7 +153,17 @@ class LocalProvider:
 
         if not isinstance(content, str) or not content:
             raise RuntimeError("локальный API вернул пустой ответ")
-        return content
+
+        input_tokens = _token_count(data.get("prompt_eval_count"))
+        output_tokens = _token_count(data.get("eval_count"))
+        usage = None
+        if input_tokens is not None and output_tokens is not None:
+            usage = TokenUsage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+        return ChatResult(content=content, usage=usage)
 
 
 def create_provider(environ: Mapping[str, str] | None = None) -> ChatProvider:
@@ -151,8 +195,15 @@ def create_provider(environ: Mapping[str, str] | None = None) -> ChatProvider:
                 environment, "LOCAL_TIMEOUT_SECONDS", 120.0
             ),
             api_key=environment.get("LOCAL_API_KEY") or None,
+            context_window=_optional_positive_int(environment, "LOCAL_NUM_CTX"),
         )
     raise ValueError(f"неизвестный провайдер AI_PROVIDER: {provider_name}")
+
+
+def _token_count(value: object) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
 
 def _required(environment: Mapping[str, str], name: str) -> str:
@@ -186,6 +237,17 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     value = environment.get(name)
     if value is None:
         return default
+    return _parse_positive_int(value, name)
+
+
+def _optional_positive_int(environment: Mapping[str, str], name: str) -> int | None:
+    value = environment.get(name)
+    if value is None:
+        return None
+    return _parse_positive_int(value, name)
+
+
+def _parse_positive_int(value: str, name: str) -> int:
     try:
         result = int(value)
     except ValueError as error:

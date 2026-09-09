@@ -1,12 +1,22 @@
 """Сущность агента, хранящая историю диалога."""
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from .history import DEFAULT_HISTORY_LIMIT, Exchange, SQLiteHistory
-from .providers import ChatProvider, Message
+from .history import DEFAULT_HISTORY_LIMIT, Exchange, SQLiteHistory, TokenTotals
+from .providers import ChatProvider, Message, TokenUsage
 
 DEFAULT_SYSTEM_PROMPT = "Ты полезный AI-ассистент. Отвечай ясно и кратко."
+
+
+@dataclass(frozen=True)
+class AgentResponse:
+    """Ответ агента и статистика токенов после его сохранения."""
+
+    content: str
+    usage: TokenUsage | None
+    conversation_totals: TokenTotals
 
 
 class Agent:
@@ -29,7 +39,11 @@ class Agent:
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def respond(self, text: str) -> str:
-        """Отправить сообщение, сохранить и вернуть ответ агента."""
+        """Отправить сообщение, сохранить и вернуть текст ответа."""
+        return self.respond_with_usage(text).content
+
+    def respond_with_usage(self, text: str) -> AgentResponse:
+        """Отправить сообщение и вернуть ответ со статистикой токенов."""
         messages: list[Message] = [{"role": "system", "content": self._system_prompt}]
         for exchange in self._history.recent(self._history_limit):
             messages.extend(
@@ -41,14 +55,22 @@ class Agent:
 
         user_created_at = self._clock()
         messages.append({"role": "user", "content": text})
-        content = self._provider.respond(messages)
+        result = self._provider.respond(messages)
+        usage = result.usage
         self._history.add(
             Exchange(
                 user_content=text,
-                assistant_content=content,
+                assistant_content=result.content,
                 user_created_at=user_created_at,
                 assistant_created_at=self._clock(),
                 model=self._provider.model,
+                input_tokens=usage.input_tokens if usage else None,
+                output_tokens=usage.output_tokens if usage else None,
+                total_tokens=usage.total_tokens if usage else None,
             )
         )
-        return content
+        return AgentResponse(
+            content=result.content,
+            usage=usage,
+            conversation_totals=self._history.token_totals(),
+        )

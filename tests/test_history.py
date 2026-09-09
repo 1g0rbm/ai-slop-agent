@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime
 
 import pytest
@@ -43,6 +44,70 @@ def test_history_returns_recent_exchanges_in_chronological_order(tmp_path) -> No
         make_exchange(2),
         make_exchange(3),
     ]
+
+
+def test_history_sums_tokens_and_reports_missing_usage(tmp_path) -> None:
+    history = SQLiteHistory(tmp_path / "history.db")
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    history.add(
+        Exchange(
+            user_content="Учтённый вопрос",
+            assistant_content="Учтённый ответ",
+            user_created_at=timestamp,
+            assistant_created_at=timestamp,
+            model="model",
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+        )
+    )
+    history.add(make_exchange(2))
+
+    totals = history.token_totals()
+
+    assert totals.input_tokens == 100
+    assert totals.output_tokens == 20
+    assert totals.total_tokens == 120
+    assert totals.untracked_exchanges == 1
+    assert not totals.complete
+
+
+def test_history_migrates_existing_database(tmp_path) -> None:
+    path = tmp_path / "history.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE exchanges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_content TEXT NOT NULL,
+                assistant_content TEXT NOT NULL,
+                user_created_at TEXT NOT NULL,
+                assistant_created_at TEXT NOT NULL,
+                model TEXT NOT NULL
+            )
+            """
+        )
+        exchange = make_exchange(1)
+        connection.execute(
+            """
+            INSERT INTO exchanges (
+                user_content, assistant_content, user_created_at,
+                assistant_created_at, model
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                exchange.user_content,
+                exchange.assistant_content,
+                exchange.user_created_at.isoformat(),
+                exchange.assistant_created_at.isoformat(),
+                exchange.model,
+            ),
+        )
+
+    history = SQLiteHistory(path)
+
+    assert history.all() == [make_exchange(1)]
+    assert history.token_totals().untracked_exchanges == 1
 
 
 def test_history_clear_removes_all_exchanges(tmp_path) -> None:

@@ -4,13 +4,17 @@ from typer.testing import CliRunner
 
 from agent_lvl.cli import app
 from agent_lvl.history import HISTORY_DB_NAME, Exchange, SQLiteHistory
+from agent_lvl.providers import ChatResult, TokenUsage
 
 
 class FakeProvider:
     model = "test-model"
 
-    def respond(self, messages: list[dict[str, str]]) -> str:
-        return "Новый ответ"
+    def respond(self, messages: list[dict[str, str]]) -> ChatResult:
+        return ChatResult(
+            content="Новый ответ",
+            usage=TokenUsage(input_tokens=1_200, output_tokens=34, total_tokens=1_234),
+        )
 
 
 def saved_exchange() -> Exchange:
@@ -36,6 +40,20 @@ def test_cli_displays_saved_history(monkeypatch, tmp_path) -> None:
     assert "Сохранённая история: 1 пар." in result.output
     assert "Вы: Старый вопрос" in result.output
     assert "Агент: Старый ответ" in result.output
+
+
+def test_cli_displays_current_and_conversation_token_usage(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("agent_lvl.cli.create_provider", lambda: FakeProvider())
+
+    result = CliRunner().invoke(app, input="Новый вопрос\nexit\n")
+
+    assert result.exit_code == 0
+    assert "текущий запрос — 1 200" in result.output
+    assert "ответ модели — 34" in result.output
+    assert "Токены всего диалога — 1 234." in result.output
 
 
 def test_cli_clear_deletes_history_after_confirmation(monkeypatch, tmp_path) -> None:

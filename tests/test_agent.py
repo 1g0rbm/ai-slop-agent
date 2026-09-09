@@ -4,19 +4,24 @@ import pytest
 
 from agent_lvl.agent import DEFAULT_SYSTEM_PROMPT, Agent
 from agent_lvl.history import Exchange, SQLiteHistory
+from agent_lvl.providers import ChatResult, TokenUsage
 
 
 class FakeProvider:
     def __init__(
-        self, response: str = "Здравствуйте!", model: str = "test-model"
+        self,
+        response: str = "Здравствуйте!",
+        model: str = "test-model",
+        usage: TokenUsage | None = None,
     ) -> None:
         self.response = response
         self.model = model
+        self.usage = usage
         self.calls: list[list[dict[str, str]]] = []
 
-    def respond(self, messages: list[dict[str, str]]) -> str:
+    def respond(self, messages: list[dict[str, str]]) -> ChatResult:
         self.calls.append(messages)
-        return self.response
+        return ChatResult(content=self.response, usage=self.usage)
 
 
 def test_agent_sends_system_prompt_and_persists_history(tmp_path) -> None:
@@ -102,7 +107,7 @@ def test_agent_does_not_save_failed_request(tmp_path) -> None:
     class FailingProvider:
         model = "failing-model"
 
-        def respond(self, messages: list[dict[str, str]]) -> str:
+        def respond(self, messages: list[dict[str, str]]) -> ChatResult:
             raise ConnectionError("соединение недоступно")
 
     history = SQLiteHistory(tmp_path / "history.db")
@@ -112,3 +117,21 @@ def test_agent_does_not_save_failed_request(tmp_path) -> None:
         agent.respond("Привет")
 
     assert history.count() == 0
+
+
+def test_agent_persists_and_returns_token_usage(tmp_path) -> None:
+    usage = TokenUsage(input_tokens=120, output_tokens=30, total_tokens=150)
+    provider = FakeProvider(usage=usage)
+    history = SQLiteHistory(tmp_path / "history.db")
+    agent = Agent(provider, history=history)
+
+    first = agent.respond_with_usage("Первый вопрос")
+    second = agent.respond_with_usage("Второй вопрос")
+
+    assert first.usage == usage
+    assert first.conversation_totals.total_tokens == 150
+    assert second.conversation_totals.input_tokens == 240
+    assert second.conversation_totals.output_tokens == 60
+    assert second.conversation_totals.total_tokens == 300
+    assert second.conversation_totals.complete
+    assert history.all()[0].total_tokens == 150
