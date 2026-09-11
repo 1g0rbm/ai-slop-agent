@@ -5,6 +5,7 @@ import pytest
 
 from agent_lvl.history import (
     DEFAULT_HISTORY_LIMIT,
+    ConversationSummary,
     Exchange,
     SQLiteHistory,
     history_limit,
@@ -110,14 +111,54 @@ def test_history_migrates_existing_database(tmp_path) -> None:
     assert history.token_totals().untracked_exchanges == 1
 
 
-def test_history_clear_removes_all_exchanges(tmp_path) -> None:
+def test_history_selects_summary_batch_before_recent_exchanges(tmp_path) -> None:
+    history = SQLiteHistory(tmp_path / "history.db")
+    for number in range(1, 6):
+        history.add(make_exchange(number))
+
+    batch = history.summary_batch(recent_limit=2, batch_exchanges=2)
+
+    assert [item.exchange for item in batch] == [make_exchange(1), make_exchange(2)]
+
+
+def test_history_stores_summary_and_continues_after_checkpoint(tmp_path) -> None:
+    history = SQLiteHistory(tmp_path / "history.db")
+    for number in range(1, 5):
+        history.add(make_exchange(number))
+    summary = ConversationSummary(
+        content="Сводка первых двух пар",
+        through_exchange_id=2,
+        summarized_messages=4,
+        model="summary-model",
+        updated_at=datetime(2026, 2, 1, tzinfo=UTC),
+    )
+
+    history.save_summary(summary)
+
+    assert history.summary() == summary
+    assert [
+        item.exchange for item in history.recent_after(summary.through_exchange_id, -1)
+    ] == [make_exchange(3), make_exchange(4)]
+
+
+def test_history_clear_removes_exchanges_and_summary(tmp_path) -> None:
     history = SQLiteHistory(tmp_path / "history.db")
     history.add(make_exchange(1))
+    history.save_summary(
+        ConversationSummary(
+            content="Сводка",
+            through_exchange_id=1,
+            summarized_messages=2,
+            model="model",
+            updated_at=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+    )
 
     history.clear()
 
     assert history.all() == []
     assert history.count() == 0
+    assert history.summary() is None
 
 
 @pytest.mark.parametrize(

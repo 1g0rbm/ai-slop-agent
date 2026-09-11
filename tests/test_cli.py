@@ -56,6 +56,18 @@ def test_cli_displays_current_and_conversation_token_usage(
     assert "Токены всего диалога — 1 234." in result.output
 
 
+def test_cli_rejects_invalid_summary_batch(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUMMARY_BATCH_MESSAGES", "3")
+    monkeypatch.setattr("agent_lvl.cli.create_provider", lambda: FakeProvider())
+
+    result = CliRunner().invoke(app)
+
+    assert result.exit_code == 1
+    assert "Ошибка конфигурации" in result.output
+    assert "SUMMARY_BATCH_MESSAGES" in result.output
+
+
 def test_cli_clear_deletes_history_after_confirmation(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("agent_lvl.cli.create_provider", lambda: FakeProvider())

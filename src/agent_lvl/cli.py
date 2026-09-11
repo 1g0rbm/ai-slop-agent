@@ -6,6 +6,7 @@ import typer
 from dotenv import load_dotenv
 
 from .agent import Agent, AgentResponse
+from .context import summary_batch_messages
 from .history import HISTORY_DB_NAME, SQLiteHistory, history_limit
 from .providers import create_provider
 
@@ -23,6 +24,7 @@ def chat() -> None:
             create_provider(),
             history=history,
             history_limit=history_limit(os.environ),
+            summary_batch_messages=summary_batch_messages(os.environ),
         )
     except ValueError as error:
         typer.echo(f"Ошибка конфигурации: {error}", err=True)

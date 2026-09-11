@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from agent_lvl.agent import DEFAULT_SYSTEM_PROMPT, Agent
+from agent_lvl.context import SUMMARY_CONTEXT_PREFIX
 from agent_lvl.history import Exchange, SQLiteHistory
 from agent_lvl.providers import ChatResult, TokenUsage
 
@@ -101,6 +102,68 @@ def test_agent_limits_history_by_completed_pairs(
         message["content"] for message in provider.calls[0] if message["role"] == "user"
     ]
     assert questions == [*expected_previous_questions, "Новый вопрос"]
+
+
+def test_agent_replaces_old_history_with_summary(tmp_path) -> None:
+    history = SQLiteHistory(tmp_path / "history.db")
+    timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+    for number in range(1, 4):
+        history.add(
+            Exchange(
+                user_content=f"Вопрос {number}",
+                assistant_content=f"Ответ {number}",
+                user_created_at=timestamp,
+                assistant_created_at=timestamp,
+                model="old-model",
+            )
+        )
+    provider = FakeProvider(response="Накопительная сводка")
+    agent = Agent(
+        provider,
+        history=history,
+        history_limit=1,
+        summary_batch_messages=4,
+    )
+
+    agent.respond("Новый вопрос")
+
+    assert len(provider.calls) == 2
+    assert "Вопрос 1" in provider.calls[0][1]["content"]
+    assert "Ответ 2" in provider.calls[0][1]["content"]
+    assert provider.calls[1] == [
+        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": f"{SUMMARY_CONTEXT_PREFIX}\nНакопительная сводка",
+        },
+        {"role": "user", "content": "Вопрос 3"},
+        {"role": "assistant", "content": "Ответ 3"},
+        {"role": "user", "content": "Новый вопрос"},
+    ]
+    summary = history.summary()
+    assert summary is not None
+    assert summary.through_exchange_id == 2
+    assert summary.summarized_messages == 4
+    assert [exchange.user_content for exchange in history.all()] == [
+        "Вопрос 1",
+        "Вопрос 2",
+        "Вопрос 3",
+        "Новый вопрос",
+    ]
+
+    agent.respond("Следующий вопрос")
+    agent.respond("Ещё вопрос")
+
+    second_summary_request = provider.calls[3][1]["content"]
+    assert "Предыдущее краткое содержание:\nНакопительная сводка" in (
+        second_summary_request
+    )
+    assert "Пользователь: Вопрос 3" in second_summary_request
+    assert "Пользователь: Новый вопрос" in second_summary_request
+    updated_summary = history.summary()
+    assert updated_summary is not None
+    assert updated_summary.through_exchange_id == 4
+    assert updated_summary.summarized_messages == 8
 
 
 def test_agent_does_not_save_failed_request(tmp_path) -> None:
