@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from .agent import Agent, AgentResponse
 from .context import summary_batch_messages
 from .history import HISTORY_DB_NAME, OperationTotals, SQLiteHistory, history_limit
+from .memory import MemoryEntry, MemoryType, TaskStatus
 from .providers import create_provider
 from .service import ConversationService
 
@@ -43,9 +44,8 @@ def chat() -> None:
 
     typer.echo(
         f"Чат запущен. Провайдер: {provider_name}. Команды: "
-        "'/strategy [имя]', '/branch [list]', "
-        "'/branch checkpoint <имя>', '/branch create <имя> [checkpoint]', "
-        "'/branch switch <имя>', '/clear'; 'exit' или 'quit' для завершения."
+        "'/strategy [имя]', '/branch [list]', '/task', '/memory', "
+        "'/clear'; 'exit' или 'quit' для завершения."
     )
     while True:
         try:
@@ -59,9 +59,12 @@ def chat() -> None:
         if command in {"exit", "quit"}:
             break
         if command == "/clear":
-            if typer.confirm("Удалить всю историю?", default=False):
+            if typer.confirm(
+                "Удалить текущий диалог и working memory? Long-term memory сохранится.",
+                default=False,
+            ):
                 history.clear()
-                typer.echo("История удалена.")
+                typer.echo("Текущий диалог и working memory удалены.")
             else:
                 typer.echo("Очистка отменена.")
             continue
@@ -87,6 +90,10 @@ def _handle_command(service: ConversationService, command: str) -> None:
             _handle_strategy_command(service, parts)
         elif name == "/branch":
             _handle_branch_command(service, parts)
+        elif name == "/task":
+            _handle_task_command(service, parts)
+        elif name == "/memory":
+            _handle_memory_command(service, parts)
         else:
             raise ValueError(f"неизвестная команда {parts[0]!r}")
     except ValueError as error:
@@ -136,6 +143,147 @@ def _handle_branch_command(service: ConversationService, parts: list[str]) -> No
         "использование: /branch [list|checkpoint <имя>|"
         "create <имя> [checkpoint]|switch <имя>]"
     )
+
+
+def _handle_task_command(service: ConversationService, parts: list[str]) -> None:
+    if len(parts) == 1:
+        task = service.active_task()
+        if task is None:
+            typer.echo("Активной задачи нет.")
+        else:
+            typer.echo(f"Активная задача #{task.id}: {task.title}.")
+        return
+
+    action = parts[1].lower()
+    if action == "new" and len(parts) >= 3:
+        task = service.create_task(" ".join(parts[2:]))
+        typer.echo(f"Задача создана: #{task.id} {task.title}.")
+        return
+    if action == "list" and len(parts) == 2:
+        tasks = service.list_tasks()
+        if not tasks:
+            typer.echo("Задач нет.")
+            return
+        typer.echo("Задачи:")
+        for task in tasks:
+            typer.echo(f"- #{task.id} [{_task_status(task.status)}] {task.title}")
+        return
+    if action == "show" and len(parts) == 3:
+        task_id = _positive_id(parts[2])
+        task = service.task(task_id)
+        typer.echo(f"Задача #{task.id}: {task.title} [{_task_status(task.status)}].")
+        entries = service.list_memory(MemoryType.WORKING, task_id=task.id)
+        _display_memory_entries(entries)
+        return
+    if action == "complete" and len(parts) == 2:
+        task = service.complete_task()
+        typer.echo(f"Задача #{task.id} завершена.")
+        return
+    if action == "cancel" and len(parts) == 2:
+        task = service.cancel_task()
+        typer.echo(f"Задача #{task.id} отменена.")
+        return
+    raise ValueError(
+        "использование: /task [new <название...>|list|show <id>|complete|cancel]"
+    )
+
+
+def _handle_memory_command(service: ConversationService, parts: list[str]) -> None:
+    if len(parts) == 1:
+        typer.echo("Память:")
+        typer.echo(
+            f"- short-term: {len(service.list_memory(MemoryType.SHORT_TERM))} записей"
+        )
+        task = service.active_task()
+        working_count = (
+            len(service.list_memory(MemoryType.WORKING)) if task is not None else 0
+        )
+        typer.echo(f"- working: {working_count} записей")
+        typer.echo(
+            f"- long-term: {len(service.list_memory(MemoryType.LONG_TERM))} записей"
+        )
+        return
+
+    action = parts[1].lower()
+    if action == "list" and len(parts) == 3:
+        memory_type = _parse_memory_type(parts[2])
+        _display_memory_entries(service.list_memory(memory_type))
+        return
+    if action == "set" and len(parts) >= 6:
+        memory_type = _parse_mutable_memory_type(parts[2])
+        entry = service.set_memory(memory_type, parts[3], parts[4], " ".join(parts[5:]))
+        typer.echo(f"Память обновлена: {entry.category}/{entry.key}.")
+        return
+    if action == "delete" and len(parts) == 5:
+        memory_type = _parse_mutable_memory_type(parts[2])
+        deleted = service.delete_memory(memory_type, parts[3], parts[4])
+        typer.echo("Запись удалена." if deleted else "Запись не найдена.")
+        return
+    if action == "clear" and len(parts) == 3:
+        memory_type = _parse_mutable_memory_type(parts[2])
+        if memory_type is MemoryType.LONG_TERM and not typer.confirm(
+            "Удалить всю long-term memory? Это действие необратимо.",
+            default=False,
+        ):
+            typer.echo("Очистка отменена.")
+            return
+        count = service.clear_memory(memory_type)
+        typer.echo(f"Память очищена. Удалено записей: {count}.")
+        return
+    if action == "promote" and len(parts) in {5, 6}:
+        new_key = parts[5] if len(parts) == 6 else None
+        entry = service.promote_memory(parts[2], parts[3], parts[4], new_key)
+        typer.echo(f"Запись скопирована в long-term: {entry.category}/{entry.key}.")
+        return
+    raise ValueError(
+        "использование: /memory [list <тип>|set <working|long-term> "
+        "<категория> <ключ> <значение...>|delete <working|long-term> "
+        "<категория> <ключ>|clear <working|long-term>|promote "
+        "<working-категория> <ключ> <long-категория> [новый-ключ]]"
+    )
+
+
+def _display_memory_entries(entries: list[MemoryEntry]) -> None:
+    if not entries:
+        typer.echo("Записей памяти нет.")
+        return
+    typer.echo("Записи памяти:")
+    for entry in entries:
+        typer.echo(f"- #{entry.id} {entry.category}/{entry.key}: {entry.value}")
+
+
+def _parse_memory_type(value: str) -> MemoryType:
+    try:
+        return MemoryType(value.lower())
+    except ValueError as error:
+        raise ValueError(
+            "тип памяти должен быть short-term, working или long-term"
+        ) from error
+
+
+def _parse_mutable_memory_type(value: str) -> MemoryType:
+    memory_type = _parse_memory_type(value)
+    if memory_type is MemoryType.SHORT_TERM:
+        raise ValueError("short-term memory доступна только для чтения")
+    return memory_type
+
+
+def _positive_id(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise ValueError("id задачи должен быть целым числом") from error
+    if result <= 0:
+        raise ValueError("id задачи должен быть положительным")
+    return result
+
+
+def _task_status(status: TaskStatus) -> str:
+    return {
+        TaskStatus.ACTIVE: "активна",
+        TaskStatus.COMPLETED: "завершена",
+        TaskStatus.CANCELLED: "отменена",
+    }[status]
 
 
 def _display_token_usage(

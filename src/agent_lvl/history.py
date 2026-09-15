@@ -7,6 +7,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .memory import (
+    DEFAULT_OWNER_ID,
+    MemoryEntry,
+    MemoryType,
+    Task,
+    TaskStatus,
+    validate_memory_fields,
+    validate_task_title,
+)
+
 HISTORY_DB_NAME = "history.db"
 DEFAULT_HISTORY_LIMIT = 20
 DEFAULT_CONVERSATION_ID = 1
@@ -58,6 +68,7 @@ class Conversation:
     """Диалог и его текущая стратегия контекста."""
 
     id: int
+    owner_id: int
     title: str
     strategy: str
     active_branch_id: int
@@ -185,7 +196,7 @@ class SQLiteHistory:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, title, strategy, active_branch_id,
+                SELECT id, owner_id, title, strategy, active_branch_id,
                        created_at, updated_at
                 FROM conversations
                 WHERE id = ?
@@ -462,6 +473,309 @@ class SQLiteHistory:
         """Вернуть число пар на пути активной ветки."""
         return len(self._active_path())
 
+    def create_task(
+        self,
+        title: str,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Создать единственную активную задачу разговора."""
+        self._validate_conversation_id(conversation_id)
+        title = validate_task_title(title)
+        now = self._now_iso()
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO tasks (
+                        conversation_id, title, status, created_at, updated_at
+                    ) VALUES (?, ?, 'active', ?, ?)
+                    """,
+                    (conversation_id, title, now, now),
+                )
+                task_id = int(cursor.lastrowid)
+        except sqlite3.IntegrityError as error:
+            raise ValueError("в разговоре уже есть активная задача") from error
+        return self.task(task_id, conversation_id)
+
+    def active_task(
+        self, conversation_id: int = DEFAULT_CONVERSATION_ID
+    ) -> Task | None:
+        """Вернуть активную задачу разговора, если она есть."""
+        self._validate_conversation_id(conversation_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, conversation_id, title, status, created_at,
+                       updated_at, completed_at
+                FROM tasks
+                WHERE conversation_id = ? AND status = 'active'
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return self._task_from_row(row) if row is not None else None
+
+    def list_tasks(self, conversation_id: int = DEFAULT_CONVERSATION_ID) -> list[Task]:
+        """Вернуть задачи разговора от новых к старым."""
+        self._validate_conversation_id(conversation_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, conversation_id, title, status, created_at,
+                       updated_at, completed_at
+                FROM tasks
+                WHERE conversation_id = ?
+                ORDER BY id DESC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    def task(
+        self,
+        task_id: int,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Вернуть задачу разговора по идентификатору."""
+        self._validate_conversation_id(conversation_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, conversation_id, title, status, created_at,
+                       updated_at, completed_at
+                FROM tasks
+                WHERE id = ? AND conversation_id = ?
+                """,
+                (task_id, conversation_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"задача с id={task_id} не найдена")
+        return self._task_from_row(row)
+
+    def complete_task(
+        self,
+        task_id: int | None = None,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Завершить активную задачу."""
+        return self._finish_task(TaskStatus.COMPLETED, task_id, conversation_id)
+
+    def cancel_task(
+        self,
+        task_id: int | None = None,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Отменить активную задачу."""
+        return self._finish_task(TaskStatus.CANCELLED, task_id, conversation_id)
+
+    def list_memory(
+        self,
+        memory_type: MemoryType,
+        *,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+        task_id: int | None = None,
+    ) -> list[MemoryEntry]:
+        """Вернуть записи выбранного уровня в устойчивом порядке."""
+        memory_type = self._memory_type(memory_type)
+        self._validate_conversation_id(conversation_id)
+        if memory_type is MemoryType.SHORT_TERM:
+            return self._short_term_entries()
+        with self._connect() as connection:
+            if memory_type is MemoryType.WORKING:
+                selected_task = self._working_task(connection, conversation_id, task_id)
+                rows = connection.execute(
+                    """
+                    SELECT id, category, key, value, created_at, updated_at
+                    FROM working_memory
+                    WHERE task_id = ?
+                    ORDER BY category, key
+                    """,
+                    (selected_task.id,),
+                ).fetchall()
+                return [
+                    self._memory_from_row(
+                        row,
+                        memory_type,
+                        conversation_id=conversation_id,
+                        task_id=selected_task.id,
+                    )
+                    for row in rows
+                ]
+            owner_id = self._conversation_owner_id(connection, conversation_id)
+            rows = connection.execute(
+                """
+                SELECT id, category, key, value, created_at, updated_at
+                FROM long_term_memory
+                WHERE owner_id = ?
+                ORDER BY category, key
+                """,
+                (owner_id,),
+            ).fetchall()
+        return [
+            self._memory_from_row(row, memory_type, owner_id=owner_id) for row in rows
+        ]
+
+    def set_memory(
+        self,
+        memory_type: MemoryType,
+        category: str,
+        key: str,
+        value: str,
+        *,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> MemoryEntry:
+        """Создать или обновить запись working/long-term памяти."""
+        memory_type = self._mutable_memory_type(memory_type)
+        category, key, validated_value = validate_memory_fields(
+            memory_type, category, key, value
+        )
+        assert validated_value is not None
+        value = validated_value
+        self._validate_conversation_id(conversation_id)
+        now = self._now_iso()
+        with self._connect() as connection:
+            if memory_type is MemoryType.WORKING:
+                task = self._working_task(connection, conversation_id)
+                table, scope, scope_id = "working_memory", "task_id", task.id
+            else:
+                owner_id = self._conversation_owner_id(connection, conversation_id)
+                table, scope, scope_id = "long_term_memory", "owner_id", owner_id
+            connection.execute(
+                f"""
+                INSERT INTO {table} (
+                    {scope}, category, key, value, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT({scope}, category, key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (scope_id, category, key, value, now, now),
+            )
+            row = connection.execute(
+                f"""
+                SELECT id, category, key, value, created_at, updated_at
+                FROM {table}
+                WHERE {scope} = ? AND category = ? AND key = ?
+                """,
+                (scope_id, category, key),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("сохранённая запись памяти не найдена")
+        is_working = memory_type is MemoryType.WORKING
+        return self._memory_from_row(
+            row,
+            memory_type,
+            conversation_id=conversation_id if is_working else None,
+            task_id=scope_id if is_working else None,
+            owner_id=scope_id if memory_type is MemoryType.LONG_TERM else None,
+        )
+
+    def delete_memory(
+        self,
+        memory_type: MemoryType,
+        category: str,
+        key: str,
+        *,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> bool:
+        """Удалить одну запись working/long-term памяти."""
+        memory_type = self._mutable_memory_type(memory_type)
+        category, key, _ = validate_memory_fields(memory_type, category, key)
+        self._validate_conversation_id(conversation_id)
+        with self._connect() as connection:
+            if memory_type is MemoryType.WORKING:
+                task = self._working_task(connection, conversation_id)
+                cursor = connection.execute(
+                    """
+                    DELETE FROM working_memory
+                    WHERE task_id = ? AND category = ? AND key = ?
+                    """,
+                    (task.id, category, key),
+                )
+            else:
+                owner_id = self._conversation_owner_id(connection, conversation_id)
+                cursor = connection.execute(
+                    """
+                    DELETE FROM long_term_memory
+                    WHERE owner_id = ? AND category = ? AND key = ?
+                    """,
+                    (owner_id, category, key),
+                )
+        return cursor.rowcount > 0
+
+    def clear_memory(
+        self,
+        memory_type: MemoryType,
+        *,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> int:
+        """Очистить working/long-term память текущего scope."""
+        memory_type = self._mutable_memory_type(memory_type)
+        self._validate_conversation_id(conversation_id)
+        with self._connect() as connection:
+            if memory_type is MemoryType.WORKING:
+                task = self._working_task(connection, conversation_id)
+                cursor = connection.execute(
+                    "DELETE FROM working_memory WHERE task_id = ?", (task.id,)
+                )
+            else:
+                owner_id = self._conversation_owner_id(connection, conversation_id)
+                cursor = connection.execute(
+                    "DELETE FROM long_term_memory WHERE owner_id = ?", (owner_id,)
+                )
+        return cursor.rowcount
+
+    def promote_memory(
+        self,
+        working_category: str,
+        key: str,
+        long_category: str,
+        new_key: str | None = None,
+        *,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> MemoryEntry:
+        """Атомарно скопировать working-запись в long-term, сохранив источник."""
+        working_category, key, _ = validate_memory_fields(
+            MemoryType.WORKING, working_category, key
+        )
+        target_key = new_key if new_key is not None else key
+        long_category, target_key, _ = validate_memory_fields(
+            MemoryType.LONG_TERM, long_category, target_key
+        )
+        self._validate_conversation_id(conversation_id)
+        now = self._now_iso()
+        with self._connect() as connection:
+            task = self._working_task(connection, conversation_id)
+            owner_id = self._conversation_owner_id(connection, conversation_id)
+            source = connection.execute(
+                """
+                SELECT value FROM working_memory
+                WHERE task_id = ? AND category = ? AND key = ?
+                """,
+                (task.id, working_category, key),
+            ).fetchone()
+            if source is None:
+                raise ValueError("запись working memory не найдена")
+            connection.execute(
+                """
+                INSERT INTO long_term_memory (
+                    owner_id, category, key, value, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(owner_id, category, key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (owner_id, long_category, target_key, source[0], now, now),
+            )
+            row = connection.execute(
+                """
+                SELECT id, category, key, value, created_at, updated_at
+                FROM long_term_memory
+                WHERE owner_id = ? AND category = ? AND key = ?
+                """,
+                (owner_id, long_category, target_key),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("promoted запись памяти не найдена")
+        return self._memory_from_row(row, MemoryType.LONG_TERM, owner_id=owner_id)
+
     def clear(self) -> None:
         """Полностью сбросить диалог к основной ветке и стратегии summary."""
         now = self._now_iso()
@@ -486,6 +800,35 @@ class SQLiteHistory:
                 main_id = int(cursor.lastrowid)
             else:
                 main_id = int(main_row[0])
+            active_task = connection.execute(
+                """
+                SELECT id FROM tasks
+                WHERE conversation_id = ? AND status = 'active'
+                """,
+                (DEFAULT_CONVERSATION_ID,),
+            ).fetchone()
+            if active_task is not None:
+                connection.execute(
+                    "DELETE FROM working_memory WHERE task_id = ?",
+                    (int(active_task[0]),),
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'cancelled', completed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, int(active_task[0])),
+                )
+            connection.execute(
+                """
+                DELETE FROM working_memory
+                WHERE task_id IN (
+                    SELECT id FROM tasks WHERE conversation_id = ?
+                )
+                """,
+                (DEFAULT_CONVERSATION_ID,),
+            )
             connection.execute("DELETE FROM conversation_summaries")
             connection.execute("DELETE FROM facts")
             connection.execute("DELETE FROM checkpoints")
@@ -678,6 +1021,7 @@ class SQLiteHistory:
     def _initialize(self) -> None:
         with self._connect() as connection:
             self._create_schema(connection)
+            self._migrate_conversation_columns(connection)
             self._migrate_exchange_columns(connection)
             self._migrate_fact_columns(connection)
             self._create_indexes(connection)
@@ -685,11 +1029,13 @@ class SQLiteHistory:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO conversations (
-                    id, title, strategy, active_branch_id, created_at, updated_at
-                ) VALUES (?, ?, 'summary', NULL, ?, ?)
+                    id, owner_id, title, strategy, active_branch_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'summary', NULL, ?, ?)
                 """,
                 (
                     DEFAULT_CONVERSATION_ID,
+                    DEFAULT_OWNER_ID,
                     DEFAULT_CONVERSATION_TITLE,
                     now,
                     now,
@@ -707,6 +1053,7 @@ class SQLiteHistory:
             """
             CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY,
+                owner_id INTEGER NOT NULL DEFAULT 1,
                 title TEXT NOT NULL,
                 strategy TEXT NOT NULL,
                 active_branch_id INTEGER,
@@ -805,6 +1152,47 @@ class SQLiteHistory:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS working_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (task_id, category, key)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (owner_id, category, key)
+            )
+            """
+        )
 
     @staticmethod
     def _create_indexes(connection: sqlite3.Connection) -> None:
@@ -820,6 +1208,37 @@ class SQLiteHistory:
             ON maintenance_usage(conversation_id, operation)
             """
         )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS tasks_active_conversation_idx
+            ON tasks(conversation_id)
+            WHERE status = 'active'
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS working_memory_task_idx
+            ON working_memory(task_id)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS long_term_memory_owner_idx
+            ON long_term_memory(owner_id)
+            """
+        )
+
+    @staticmethod
+    def _migrate_conversation_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(conversations)").fetchall()
+        }
+        if "owner_id" not in columns:
+            connection.execute(
+                "ALTER TABLE conversations ADD COLUMN owner_id "
+                "INTEGER NOT NULL DEFAULT 1"
+            )
 
     @staticmethod
     def _migrate_exchange_columns(connection: sqlite3.Connection) -> None:
@@ -960,13 +1379,19 @@ class SQLiteHistory:
             ("facts", "rowid", ("created_at", "updated_at")),
             ("conversation_summaries", "branch_id", ("updated_at",)),
             ("maintenance_usage", "id", ("created_at",)),
+            ("tasks", "id", ("created_at", "updated_at", "completed_at")),
+            ("working_memory", "id", ("created_at", "updated_at")),
+            ("long_term_memory", "id", ("created_at", "updated_at")),
         )
         for table, identity, columns in targets:
             selected = ", ".join((identity, *columns))
             rows = connection.execute(f"SELECT {selected} FROM {table}").fetchall()
             for row in rows:
                 values = [
-                    cls._normalized_datetime_text(str(value)) for value in row[1:]
+                    cls._normalized_datetime_text(str(value))
+                    if value is not None
+                    else None
+                    for value in row[1:]
                 ]
                 assignments = ", ".join(f"{column} = ?" for column in columns)
                 connection.execute(
@@ -1076,6 +1501,162 @@ class SQLiteHistory:
             ),
         )
 
+    def _finish_task(
+        self,
+        status: TaskStatus,
+        task_id: int | None,
+        conversation_id: int,
+    ) -> Task:
+        self._validate_conversation_id(conversation_id)
+        now = self._now_iso()
+        with self._connect() as connection:
+            if task_id is None:
+                row = connection.execute(
+                    """
+                    SELECT id FROM tasks
+                    WHERE conversation_id = ? AND status = 'active'
+                    """,
+                    (conversation_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("активная задача не найдена")
+                task_id = int(row[0])
+            cursor = connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, completed_at = ?, updated_at = ?
+                WHERE id = ? AND conversation_id = ? AND status = 'active'
+                """,
+                (status.value, now, now, task_id, conversation_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"активная задача с id={task_id} не найдена")
+        return self.task(task_id, conversation_id)
+
+    @staticmethod
+    def _working_task(
+        connection: sqlite3.Connection,
+        conversation_id: int,
+        task_id: int | None = None,
+    ) -> Task:
+        if task_id is None:
+            row = connection.execute(
+                """
+                SELECT id, conversation_id, title, status, created_at,
+                       updated_at, completed_at
+                FROM tasks
+                WHERE conversation_id = ? AND status = 'active'
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(
+                    "для working memory требуется активная задача; "
+                    "создайте её командой /task new"
+                )
+        else:
+            row = connection.execute(
+                """
+                SELECT id, conversation_id, title, status, created_at,
+                       updated_at, completed_at
+                FROM tasks
+                WHERE id = ? AND conversation_id = ?
+                """,
+                (task_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"задача с id={task_id} не найдена")
+        return SQLiteHistory._task_from_row(row)
+
+    def _short_term_entries(self) -> list[MemoryEntry]:
+        entries: list[MemoryEntry] = []
+        for item in self._active_path():
+            exchange = item.exchange
+            entries.append(
+                MemoryEntry(
+                    id=item.id,
+                    memory_type=MemoryType.SHORT_TERM,
+                    category="exchange",
+                    key=str(item.id),
+                    value=(
+                        f"Пользователь: {exchange.user_content}\n"
+                        f"Ассистент: {exchange.assistant_content}"
+                    ),
+                    conversation_id=DEFAULT_CONVERSATION_ID,
+                    created_at=exchange.user_created_at,
+                    updated_at=exchange.assistant_created_at,
+                )
+            )
+        return entries
+
+    @staticmethod
+    def _memory_type(memory_type: MemoryType) -> MemoryType:
+        try:
+            return MemoryType(memory_type)
+        except ValueError as error:
+            allowed = ", ".join(item.value for item in MemoryType)
+            raise ValueError(f"неизвестный тип памяти; доступны: {allowed}") from error
+
+    @classmethod
+    def _mutable_memory_type(cls, memory_type: MemoryType) -> MemoryType:
+        result = cls._memory_type(memory_type)
+        if result is MemoryType.SHORT_TERM:
+            raise ValueError("short-term memory доступна только для чтения")
+        return result
+
+    @staticmethod
+    def _validate_conversation_id(conversation_id: int) -> None:
+        if conversation_id != DEFAULT_CONVERSATION_ID:
+            raise ValueError(f"разговор с id={conversation_id} не найден")
+
+    @staticmethod
+    def _conversation_owner_id(
+        connection: sqlite3.Connection, conversation_id: int
+    ) -> int:
+        row = connection.execute(
+            "SELECT owner_id FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"разговор с id={conversation_id} не найден")
+        return int(row[0])
+
+    @staticmethod
+    def _task_from_row(row: tuple[object, ...]) -> Task:
+        return Task(
+            id=int(row[0]),
+            conversation_id=int(row[1]),
+            title=str(row[2]),
+            status=TaskStatus(str(row[3])),
+            created_at=SQLiteHistory._datetime_from_db(row[4]),
+            updated_at=SQLiteHistory._datetime_from_db(row[5]),
+            completed_at=(
+                SQLiteHistory._datetime_from_db(row[6]) if row[6] is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _memory_from_row(
+        row: tuple[object, ...],
+        memory_type: MemoryType,
+        *,
+        conversation_id: int | None = None,
+        task_id: int | None = None,
+        owner_id: int | None = None,
+    ) -> MemoryEntry:
+        return MemoryEntry(
+            id=int(row[0]),
+            memory_type=memory_type,
+            category=str(row[1]),
+            key=str(row[2]),
+            value=str(row[3]),
+            created_at=SQLiteHistory._datetime_from_db(row[4]),
+            updated_at=SQLiteHistory._datetime_from_db(row[5]),
+            conversation_id=conversation_id,
+            task_id=task_id,
+            owner_id=owner_id,
+        )
+
     @staticmethod
     def _validate_fact_operation(operation: FactOperation) -> None:
         if not isinstance(operation, FactOperation):
@@ -1123,11 +1704,12 @@ class SQLiteHistory:
     def _conversation_from_row(row: tuple[object, ...]) -> Conversation:
         return Conversation(
             id=int(row[0]),
-            title=str(row[1]),
-            strategy=str(row[2]),
-            active_branch_id=int(row[3]),
-            created_at=SQLiteHistory._datetime_from_db(row[4]),
-            updated_at=SQLiteHistory._datetime_from_db(row[5]),
+            owner_id=int(row[1]),
+            title=str(row[2]),
+            strategy=str(row[3]),
+            active_branch_id=int(row[4]),
+            created_at=SQLiteHistory._datetime_from_db(row[5]),
+            updated_at=SQLiteHistory._datetime_from_db(row[6]),
         )
 
     @staticmethod

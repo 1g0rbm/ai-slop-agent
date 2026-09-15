@@ -10,6 +10,7 @@ from .history import (
     Checkpoint,
     SQLiteHistory,
 )
+from .memory import MemoryEntry, MemoryType, Task
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,122 @@ class ConversationService:
         previous = self._history.strategy()
         self._agent.set_strategy(normalized)
         return StrategyChange(previous=previous, current=normalized)
+
+    def create_task(
+        self,
+        title: str,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Создать активную задачу разговора."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.create_task(title, conversation_id)
+
+    def active_task(
+        self, conversation_id: int = DEFAULT_CONVERSATION_ID
+    ) -> Task | None:
+        """Вернуть активную задачу разговора."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.active_task(conversation_id)
+
+    def list_tasks(self, conversation_id: int = DEFAULT_CONVERSATION_ID) -> list[Task]:
+        """Вернуть задачи разговора."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.list_tasks(conversation_id)
+
+    def task(
+        self,
+        task_id: int,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> Task:
+        """Вернуть задачу по идентификатору."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.task(task_id, conversation_id)
+
+    def complete_task(self, conversation_id: int = DEFAULT_CONVERSATION_ID) -> Task:
+        """Завершить активную задачу."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.complete_task(conversation_id=conversation_id)
+
+    def cancel_task(self, conversation_id: int = DEFAULT_CONVERSATION_ID) -> Task:
+        """Отменить активную задачу."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.cancel_task(conversation_id=conversation_id)
+
+    def list_memory(
+        self,
+        memory_type: MemoryType,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+        *,
+        task_id: int | None = None,
+    ) -> list[MemoryEntry]:
+        """Вернуть память выбранного уровня."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.list_memory(
+            memory_type,
+            conversation_id=conversation_id,
+            task_id=task_id,
+        )
+
+    def set_memory(
+        self,
+        memory_type: MemoryType,
+        category: str,
+        key: str,
+        value: str,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> MemoryEntry:
+        """Создать или обновить запись памяти."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.set_memory(
+            memory_type,
+            category,
+            key,
+            value,
+            conversation_id=conversation_id,
+        )
+
+    def delete_memory(
+        self,
+        memory_type: MemoryType,
+        category: str,
+        key: str,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> bool:
+        """Удалить запись памяти."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.delete_memory(
+            memory_type,
+            category,
+            key,
+            conversation_id=conversation_id,
+        )
+
+    def clear_memory(
+        self,
+        memory_type: MemoryType,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> int:
+        """Очистить выбранный изменяемый уровень памяти."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.clear_memory(memory_type, conversation_id=conversation_id)
+
+    def promote_memory(
+        self,
+        working_category: str,
+        key: str,
+        long_category: str,
+        new_key: str | None = None,
+        conversation_id: int = DEFAULT_CONVERSATION_ID,
+    ) -> MemoryEntry:
+        """Скопировать working-запись в long-term."""
+        self._ensure_default_conversation(conversation_id)
+        return self._history.promote_memory(
+            working_category,
+            key,
+            long_category,
+            new_key,
+            conversation_id=conversation_id,
+        )
 
     def active_branch(self, conversation_id: int = DEFAULT_CONVERSATION_ID) -> Branch:
         """Вернуть активную ветку разговора."""

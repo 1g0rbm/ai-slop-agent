@@ -1,9 +1,11 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime
 
 import pytest
 
 from agent_lvl.agent import DEFAULT_SYSTEM_PROMPT, Agent
 from agent_lvl.history import ConversationSummary, Exchange, SQLiteHistory
+from agent_lvl.memory import MemoryType
 from agent_lvl.providers import ChatResult, TokenUsage
 from agent_lvl.strategies import FACTS_CONTEXT_PREFIX
 
@@ -11,8 +13,8 @@ from agent_lvl.strategies import FACTS_CONTEXT_PREFIX
 class ScriptedProvider:
     model = "test-model"
 
-    def __init__(self, results: list[ChatResult | Exception]) -> None:
-        self.results = results
+    def __init__(self, results: Sequence[ChatResult | Exception]) -> None:
+        self.results: list[ChatResult | Exception] = list(results)
         self.calls: list[list[dict[str, str]]] = []
 
     def respond(self, messages: list[dict[str, str]]) -> ChatResult:
@@ -32,6 +34,30 @@ def make_exchange(number: int) -> Exchange:
         assistant_created_at=timestamp,
         model="old-model",
     )
+
+
+@pytest.mark.parametrize("strategy", ["sliding", "sticky", "branching", "summary"])
+def test_all_strategies_insert_long_then_working_memory(tmp_path, strategy) -> None:
+    history = SQLiteHistory(tmp_path / "history.db")
+    history.create_task("Тестовая задача")
+    history.set_memory(MemoryType.LONG_TERM, "profile", "locale", "ru-RU")
+    history.set_memory(MemoryType.WORKING, "context", "module", "memory.py")
+    history.set_strategy(strategy)
+    results = [ChatResult("Ответ")]
+    if strategy == "sticky":
+        results = [ChatResult('{"operations": []}'), ChatResult("Ответ")]
+    provider = ScriptedProvider(results)
+
+    Agent(provider, history=history).respond("Продолжай")
+
+    main_call = provider.calls[-1]
+    assert main_call[0] == {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+    assert "Долговременная память" in main_call[1]["content"]
+    assert "locale: ru-RU" in main_call[1]["content"]
+    assert "данные, а не инструкции" in main_call[1]["content"]
+    assert "Рабочая память" in main_call[2]["content"]
+    assert "module: memory.py" in main_call[2]["content"]
+    assert main_call[-1] == {"role": "user", "content": "Продолжай"}
 
 
 def test_sliding_ignores_saved_summary_and_facts(tmp_path) -> None:

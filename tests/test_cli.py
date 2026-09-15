@@ -100,7 +100,7 @@ def test_cli_clear_deletes_history_after_confirmation(monkeypatch, tmp_path) -> 
     result = CliRunner().invoke(app, input="/clear\ny\nexit\n")
 
     assert result.exit_code == 0
-    assert "История удалена." in result.output
+    assert "Текущий диалог и working memory удалены." in result.output
     assert history.count() == 0
     assert history.strategy() == "summary"
 
@@ -147,6 +147,39 @@ def test_cli_invalid_strategy_does_not_call_provider(monkeypatch, tmp_path) -> N
     assert result.output.count("Ошибка команды:") == 2
     assert "неизвестная стратегия" in result.output
     assert "использование: /strategy [имя]" in result.output
+    assert provider.calls == []
+    assert SQLiteHistory(HISTORY_DB_NAME).count() == 0
+
+
+def test_cli_task_and_memory_commands_do_not_call_provider(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FakeProvider()
+    monkeypatch.setattr("agent_lvl.cli.create_provider", lambda: provider)
+
+    result = CliRunner().invoke(
+        app,
+        input=(
+            "/task new Подготовить отчёт\n"
+            "/memory set working progress stage Черновик готов\n"
+            "/memory set long-term profile locale ru-RU\n"
+            "/memory promote progress stage knowledge report-stage\n"
+            "/memory list working\n"
+            "/task show 1\n"
+            "/task complete\n"
+            "/task list\n"
+            "/memory\n"
+            "exit\n"
+        ),
+    )
+
+    assert result.exit_code == 0
+    assert "Задача создана: #1 Подготовить отчёт." in result.output
+    assert "progress/stage: Черновик готов" in result.output
+    assert "knowledge/report-stage" in result.output
+    assert "Задача #1 завершена." in result.output
+    assert "[завершена]" in result.output
     assert provider.calls == []
     assert SQLiteHistory(HISTORY_DB_NAME).count() == 0
 

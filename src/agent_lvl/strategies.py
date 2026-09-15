@@ -14,6 +14,7 @@ from .history import (
     SQLiteHistory,
     StoredExchange,
 )
+from .memory import MemoryType, render_memory
 from .providers import ChatProvider, Message, TokenUsage
 
 FACT_CATEGORIES = (
@@ -103,6 +104,7 @@ class BaseContextStrategy:
     ) -> list[Message]:
         messages: list[Message] = [
             {"role": "system", "content": self._system_prompt},
+            *self._memory_context_messages(),
             *context_messages,
         ]
         _append_exchanges(
@@ -110,6 +112,31 @@ class BaseContextStrategy:
             self._history.recent_after(checkpoint, self._history_limit),
         )
         messages.append({"role": "user", "content": current_message})
+        return messages
+
+    def _memory_context_messages(self) -> list[Message]:
+        messages: list[Message] = []
+        long_term = self._history.list_memory(MemoryType.LONG_TERM)
+        if long_term:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": render_memory(
+                        long_term, "Долговременная память пользователя:"
+                    ),
+                }
+            )
+        if self._history.active_task() is not None:
+            working = self._history.list_memory(MemoryType.WORKING)
+            if working:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": render_memory(
+                            working, "Рабочая память активной задачи:"
+                        ),
+                    }
+                )
         return messages
 
 
